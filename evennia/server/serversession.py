@@ -8,36 +8,31 @@ are stored on the Portal side)
 """
 from builtins import object
 
-import re
 import weakref
-from time import time
+import time
 from django.utils import timezone
 from django.conf import settings
 from evennia.comms.models import ChannelDB
 from evennia.utils import logger
-from evennia.utils.inlinefunc import parse_inlinefunc
-from evennia.utils.nested_inlinefuncs import parse_inlinefunc as parse_nested_inlinefunc
 from evennia.utils.utils import make_iter, lazy_property
-from evennia.commands.cmdhandler import cmdhandler
 from evennia.commands.cmdsethandler import CmdSetHandler
 from evennia.server.session import Session
+from evennia.scripts.monitorhandler import MONITOR_HANDLER
 
-_IDLE_COMMAND = settings.IDLE_COMMAND
 _GA = object.__getattribute__
 _SA = object.__setattr__
 _ObjectDB = None
 _ANSI = None
-_INLINEFUNC_ENABLED = settings.INLINEFUNC_ENABLED
-_RE_SCREENREADER_REGEX = re.compile(r"%s" % settings.SCREENREADER_REGEX_STRIP, re.DOTALL + re.MULTILINE)
 
 # i18n
 from django.utils.translation import ugettext as _
 
-
 # Handlers for Session.db/ndb operation
 
+
 class NDbHolder(object):
-    "Holder for allowing property access of attributes"
+    """Holder for allowing property access of attributes"""
+
     def __init__(self, obj, name, manager_name='attributes'):
         _SA(self, name, _GA(obj, manager_name))
         _SA(self, 'name', name)
@@ -68,6 +63,7 @@ class NAttributeHandler(object):
     by the `.ndb` handler in the same way as `.db` does
     for the `AttributeHandler`.
     """
+
     def __init__(self, obj):
         """
         Initialized on the object
@@ -88,7 +84,7 @@ class NAttributeHandler(object):
         """
         return key in self._store
 
-    def get(self, key):
+    def get(self, key, default=None):
         """
         Get the named key value.
 
@@ -99,7 +95,7 @@ class NAttributeHandler(object):
             the value of the Nattribute.
 
         """
-        return self._store.get(key, None)
+        return self._store.get(key, default)
 
     def add(self, key, value):
         """
@@ -149,24 +145,25 @@ class NAttributeHandler(object):
         return [key for key in self._store if not key.startswith("_")]
 
 
-#------------------------------------------------------------
+# -------------------------------------------------------------
 # Server Session
-#------------------------------------------------------------
+# -------------------------------------------------------------
 
 class ServerSession(Session):
     """
-    This class represents a player's session and is a template for
+    This class represents an account's session and is a template for
     individual protocols to communicate with Evennia.
 
-    Each player gets a session assigned to them whenever they connect
-    to the game server. All communication between game and player goes
+    Each account gets a session assigned to them whenever they connect
+    to the game server. All communication between game and account goes
     through their session.
 
     """
+
     def __init__(self):
-        "Initiate to avoid AttributeErrors down the line"
+        """Initiate to avoid AttributeErrors down the line"""
         self.puppet = None
-        self.player = None
+        self.account = None
         self.cmdset_storage_string = ""
         self.cmdset = CmdSetHandler(self, True)
 
@@ -181,7 +178,7 @@ class ServerSession(Session):
         """
         This is called whenever a session has been resynced with the
         portal.  At this point all relevant attributes have already
-        been set and self.player been assigned (if applicable).
+        been set and self.account been assigned (if applicable).
 
         Since this is often called after a server restart we need to
         set up the session as it was.
@@ -191,6 +188,7 @@ class ServerSession(Session):
         if not _ObjectDB:
             from evennia.objects.models import ObjectDB as _ObjectDB
 
+        super(ServerSession, self).at_sync()
         if not self.logged_in:
             # assign the unloggedin-command set.
             self.cmdset_storage = settings.CMDSET_UNLOGGEDIN
@@ -204,66 +202,70 @@ class ServerSession(Session):
             # hooks, echoes or access checks.
             obj = _ObjectDB.objects.get(id=self.puid)
             obj.sessions.add(self)
-            obj.player = self.player
+            obj.account = self.account
             self.puid = obj.id
             self.puppet = obj
-            #obj.scripts.validate()
+            # obj.scripts.validate()
             obj.locks.cache_lock_bypass(obj)
 
-    def at_login(self, player):
+    def at_login(self, account):
         """
         Hook called by sessionhandler when the session becomes authenticated.
 
         Args:
-            player (Player): The player associated with the session.
+            account (Account): The account associated with the session.
 
         """
-        self.player = player
-        self.uid = self.player.id
-        self.uname = self.player.username
+        self.account = account
+        self.uid = self.account.id
+        self.uname = self.account.username
         self.logged_in = True
-        self.conn_time = time()
+        self.conn_time = time.time()
         self.puid = None
         self.puppet = None
         self.cmdset_storage = settings.CMDSET_SESSION
 
         # Update account's last login time.
-        self.player.last_login = timezone.now()
-        self.player.save()
+        self.account.last_login = timezone.now()
+        self.account.save()
 
         # add the session-level cmdset
         self.cmdset = CmdSetHandler(self, True)
 
-    def at_disconnect(self):
+    def at_disconnect(self, reason=None):
         """
         Hook called by sessionhandler when disconnecting this session.
 
         """
         if self.logged_in:
-            player = self.player
+            account = self.account
             if self.puppet:
-                player.unpuppet_object(self)
-            uaccount = player
+                account.unpuppet_object(self)
+            uaccount = account
             uaccount.last_login = timezone.now()
             uaccount.save()
-            # calling player hook
-            player.at_disconnect()
+            # calling account hook
+            account.at_disconnect(reason)
             self.logged_in = False
-            if not self.sessionhandler.sessions_from_player(player):
-                # no more sessions connected to this player
-                player.is_connected = False
-            # this may be used to e.g. delete player after disconnection etc
-            player.at_post_disconnect()
+            if not self.sessionhandler.sessions_from_account(account):
+                # no more sessions connected to this account
+                account.is_connected = False
+            # this may be used to e.g. delete account after disconnection etc
+            account.at_post_disconnect()
+            # remove any webclient settings monitors associated with this
+            # session
+            MONITOR_HANDLER.remove(account, "_saved_webclient_options",
+                                   self.sessid)
 
-    def get_player(self):
+    def get_account(self):
         """
-        Get the player associated with this session
+        Get the account associated with this session
 
         Returns:
-            player (Player): The associated Player.
+            account (Account): The associated Account.
 
         """
-        return self.logged_in and self.player
+        return self.logged_in and self.account
 
     def get_puppet(self):
         """
@@ -276,17 +278,17 @@ class ServerSession(Session):
         return self.logged_in and self.puppet
     get_character = get_puppet
 
-    def get_puppet_or_player(self):
+    def get_puppet_or_account(self):
         """
-        Get puppet or player.
+        Get puppet or account.
 
         Returns:
-            controller (Object or Player): The puppet if one exists,
-                otherwise return the player.
+            controller (Object or Account): The puppet if one exists,
+                otherwise return the account.
 
         """
         if self.logged_in:
-            return self.puppet if self.puppet else self.player
+            return self.puppet if self.puppet else self.account
         return None
 
     def log(self, message, channel=True):
@@ -299,13 +301,13 @@ class ServerSession(Session):
                 in addition to the server log.
 
         """
-        if channel:
+        cchan = channel and settings.CHANNEL_CONNECTINFO
+        if cchan:
             try:
-                cchan = settings.CHANNEL_CONNECTINFO
                 cchan = ChannelDB.objects.get_channel(cchan[0])
                 cchan.msg("[%s]: %s" % (cchan.key, message))
             except Exception:
-                pass
+                logger.log_trace()
         logger.log_info(message)
 
     def get_client_size(self):
@@ -327,83 +329,129 @@ class ServerSession(Session):
 
         """
         # Idle time used for timeout calcs.
-        self.cmd_last = time()
+        self.cmd_last = time.time()
 
         # Store the timestamp of the user's last command.
         if not idle:
             # Increment the user's command counter.
             self.cmd_total += 1
-            # Player-visible idle time, not used in idle timeout calcs.
+            # Account-visible idle time, not used in idle timeout calcs.
             self.cmd_last_visible = self.cmd_last
 
-    def data_in(self, text=None, **kwargs):
+    def update_flags(self, **kwargs):
         """
-        Send data User->Evennia. This will in effect execute a command
-        string on the server.
-
-        Note that oob data is already sent separately to the
-        oobhandler at this point.
+        Update the protocol_flags and sync them with Portal.
 
         Kwargs:
-            text (str): A text to relay
-            kwargs (any): Other parameters from the protocol.
+            key, value - A key:value pair to set in the
+                protocol_flags dictionary.
+
+        Notes:
+            Since protocols can vary, no checking is done
+            as to the existene of the flag or not. The input
+            data should have been validated before this call.
 
         """
-        #from evennia.server.profiling.timetrace import timetrace
-        #text = timetrace(text, "ServerSession.data_in")
+        if kwargs:
+            self.protocol_flags.update(kwargs)
+            self.sessionhandler.session_portal_sync(self)
 
-        #explicitly check for None since text can be an empty string, which is
-        #also valid
+    def data_out(self, **kwargs):
+        """
+        Sending data from Evennia->Client
+
+        Kwargs:
+            text (str or tuple)
+            any (str or tuple): Send-commands identified
+                by their keys. Or "options", carrying options
+                for the protocol(s).
+
+        """
+        self.sessionhandler.data_out(self, **kwargs)
+
+    def data_in(self, **kwargs):
+        """
+        Receiving data from the client, sending it off to
+        the respective inputfuncs.
+
+        Kwargs:
+            kwargs (any): Incoming data from protocol on
+                the form `{"commandname": ((args), {kwargs}),...}`
+        Notes:
+            This method is here in order to give the user
+            a single place to catch and possibly process all incoming data from
+            the client. It should usually always end by sending
+            this data off to `self.sessionhandler.call_inputfuncs(self, **kwargs)`.
+        """
+        self.sessionhandler.call_inputfuncs(self, **kwargs)
+
+    def msg(self, text=None, **kwargs):
+        """
+        Wrapper to mimic msg() functionality of Objects and Accounts.
+
+        Args:
+            text (str): String input.
+
+        Kwargs:
+            any (str or tuple): Send-commands identified
+                by their keys. Or "options", carrying options
+                for the protocol(s).
+
+        """
+        # this can happen if this is triggered e.g. a command.msg
+        # that auto-adds the session, we'd get a kwarg collision.
+        kwargs.pop("session", None)
+        kwargs.pop("from_obj", None)
         if text is not None:
-            # this is treated as a command input
-            #text = to_unicode(escape_control_sequences(text), encoding=self.encoding)
-            # handle the 'idle' command
-            if text.strip() == _IDLE_COMMAND:
-                self.update_session_counters(idle=True)
-                return
-            if self.player:
-                # nick replacement
-                puppet = self.puppet
-                if puppet:
-                    text = puppet.nicks.nickreplace(text,
-                                  categories=("inputline", "channel"), include_player=True)
-                else:
-                    text = self.player.nicks.nickreplace(text,
-                                categories=("inputline", "channels"), include_player=False)
-            cmdhandler(self, text, callertype="session", session=self)
-            self.update_session_counters()
+            self.data_out(text=text, **kwargs)
+        else:
+            self.data_out(**kwargs)
 
-    execute_cmd = data_in  # alias
-
-    def data_out(self, text=None, **kwargs):
+    def execute_cmd(self, raw_string, session=None, **kwargs):
         """
-        Send Evennia -> User
+        Do something as this object. This method is normally never
+        called directly, instead incoming command instructions are
+        sent to the appropriate inputfunc already at the sessionhandler
+        level. This method allows Python code to inject commands into
+        this stream, and will lead to the text inputfunc be called.
 
+        Args:
+            raw_string (string): Raw command input
+            session (Session): This is here to make API consistent with
+                Account/Object.execute_cmd. If given, data is passed to
+                that Session, otherwise use self.
         Kwargs:
-            text (str): A text to relay
-            kwargs (any): Other parameters to the protocol.
+            Other keyword arguments will be added to the found command
+            object instace as variables before it executes.  This is
+            unused by default Evennia but may be used to set flags and
+            change operating paramaters for commands at run-time.
 
         """
-        #from evennia.server.profiling.timetrace import timetrace
-        #text = timetrace(text, "ServerSession.data_out")
-
-        text = text if text else ""
-        if _INLINEFUNC_ENABLED and not "raw" in kwargs:
-            text = parse_inlinefunc(text, strip="strip_inlinefunc" in kwargs, session=self)
-            text = parse_nested_inlinefunc(text, strip="strip_inlinefunc" in kwargs, session=self)
-        if self.screenreader:
-            global _ANSI
-            if not _ANSI:
-                from evennia.utils import ansi as _ANSI
-            text = _ANSI.parse_ansi(text, strip_ansi=True, xterm256=False, mxp=False)
-            text = _RE_SCREENREADER_REGEX.sub("", text)
-        self.sessionhandler.data_out(self, text=text, **kwargs)
-    # alias
-    msg = data_out
+        # inject instruction into input stream
+        kwargs["text"] = ((raw_string,), {})
+        self.sessionhandler.data_in(session or self, **kwargs)
 
     def __eq__(self, other):
-        "Handle session comparisons"
-        return self.address == other.address
+        """Handle session comparisons"""
+        try:
+            return self.address == other.address
+        except AttributeError:
+            return False
+
+    def __hash__(self):
+        """
+        Python 3 requires that any class which implements __eq__ must also
+        implement __hash__ and that the corresponding hashes for equivalent
+        instances are themselves equivalent.
+
+        """
+        return hash(self.address)
+
+    def __ne__(self, other):
+        try:
+            return self.address != other.address
+        except AttributeError:
+            return True
 
     def __str__(self):
         """
@@ -412,8 +460,8 @@ class ServerSession(Session):
 
         """
         symbol = ""
-        if self.logged_in and hasattr(self, "player") and self.player:
-            symbol = "(#%s)" % self.player.id
+        if self.logged_in and hasattr(self, "account") and self.account:
+            symbol = "(#%s)" % self.account.id
         try:
             if hasattr(self.address, '__iter__'):
                 address = ":".join([str(part) for part in self.address])
@@ -423,9 +471,8 @@ class ServerSession(Session):
             address = self.address
         return "%s%s@%s" % (self.uname, symbol, address)
 
-    def __unicode__(self):
-        "Unicode representation"
-        return u"%s" % str(self)
+    def __repr__(self):
+        return "%s" % str(self)
 
     # Dummy API hooks for use during non-loggedin operation
 
@@ -448,7 +495,7 @@ class ServerSession(Session):
     def attributes(self):
         return self.nattributes
 
-    #@property
+    # @property
     def ndb_get(self):
         """
         A non-persistent store (ndb: NonDataBase). Everything stored
@@ -463,7 +510,7 @@ class ServerSession(Session):
             self._ndb_holder = NDbHolder(self, "nattrhandler", manager_name="nattributes")
             return self._ndb_holder
 
-    #@ndb.setter
+    # @ndb.setter
     def ndb_set(self, value):
         """
         Stop accidentally replacing the db object
@@ -473,12 +520,12 @@ class ServerSession(Session):
 
         """
         string = "Cannot assign directly to ndb object! "
-        string = "Use ndb.attr=value instead."
+        string += "Use ndb.attr=value instead."
         raise Exception(string)
 
-    #@ndb.deleter
+    # @ndb.deleter
     def ndb_del(self):
-        "Stop accidental deletion."
+        """Stop accidental deletion."""
         raise Exception("Cannot delete the ndb object!")
     ndb = property(ndb_get, ndb_set, ndb_del)
     db = property(ndb_get, ndb_set, ndb_del)
@@ -486,5 +533,5 @@ class ServerSession(Session):
     # Mock access method for the session (there is no lock info
     # at this stage, so we just present a uniform API)
     def access(self, *args, **kwargs):
-        "Dummy method to mimic the logged-in API."
+        """Dummy method to mimic the logged-in API."""
         return True

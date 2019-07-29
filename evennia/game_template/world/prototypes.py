@@ -38,9 +38,7 @@ See the `@spawn` command and `evennia.utils.spawner` for more info.
 
 #from random import randint
 #
-#NOBODY = {}
-#
-#GOBLIN = {
+# GOBLIN = {
 # "key": "goblin grunt",
 # "health": lambda: randint(20,30),
 # "resists": ["cold", "poison"],
@@ -48,23 +46,28 @@ See the `@spawn` command and `evennia.utils.spawner` for more info.
 # "weaknesses": ["fire", "light"]
 # }
 #
-#GOBLIN_WIZARD = {
+# GOBLIN_WIZARD = {
 # "prototype": "GOBLIN",
 # "key": "goblin wizard",
 # "spells": ["fire ball", "lighting bolt"]
 # }
 #
-#GOBLIN_ARCHER = {
+# GOBLIN_ARCHER = {
 # "prototype": "GOBLIN",
 # "key": "goblin archer",
 # "attacks": ["short bow"]
 #}
 #
-#ARCHWIZARD = {
+# This is an example of a prototype without a prototype
+# (nor key) of its own, so it should normally only be
+# used as a mix-in, as in the example of the goblin
+# archwizard below.
+# ARCHWIZARD_MIXIN = {
 # "attacks": ["archwizard staff"],
+# "spells": ["greater fire ball", "greater lighting"]
 #}
 #
-#GOBLIN_ARCHWIZARD = {
+# GOBLIN_ARCHWIZARD = {
 # "key": "goblin archwizard",
-# "prototype" : ("GOBLIN_WIZARD", "ARCHWIZARD")
+# "prototype" : ("GOBLIN_WIZARD", "ARCHWIZARD_MIXIN")
 #}

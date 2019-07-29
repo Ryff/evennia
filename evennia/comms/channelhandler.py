@@ -25,23 +25,41 @@ does this for you.
 """
 from builtins import object
 
-from evennia.comms.models import ChannelDB
+from django.conf import settings
 from evennia.commands import cmdset, command
-
+from evennia.utils.logger import tail_log_file
+from evennia.utils.utils import class_from_module
 from django.utils.translation import ugettext as _
+
+_CHANNEL_COMMAND_CLASS = None
+_CHANNELDB = None
+
 
 class ChannelCommand(command.Command):
     """
-    Channel
+    {channelkey} channel
+
+    {channeldesc}
 
     Usage:
-       <channel name or alias>  <message>
+       {lower_channelkey}  <message>
+       {lower_channelkey}/history [start]
+       {lower_channelkey} off - mutes the channel
+       {lower_channelkey} on  - unmutes the channel
 
-    This is a channel. If you have subscribed to it, you can send to
-    it by entering its name or alias, followed by the text you want to
-    send.
+    Switch:
+        history: View 20 previous messages, either from the end or
+            from <start> number of messages from the end.
+
+    Example:
+        {lower_channelkey} Hello World!
+        {lower_channelkey}/history
+        {lower_channelkey}/history 30
 
     """
+    # ^note that channeldesc and lower_channelkey will be filled
+    # automatically by ChannelHandler
+
     # this flag is what identifies this cmd as a channel cmd
     # and branches off to the system send-to-channel command
     # (which is customizable by admin)
@@ -49,6 +67,7 @@ class ChannelCommand(command.Command):
     key = "general"
     help_category = "Channel Names"
     obj = None
+    arg_regex = r"\s.*?|/history.*?"
 
     def parse(self):
         """
@@ -56,6 +75,14 @@ class ChannelCommand(command.Command):
         """
         # cmdhandler sends channame:msg here.
         channelname, msg = self.args.split(":", 1)
+        self.history_start = None
+        if msg.startswith("/history"):
+            arg = msg[8:]
+            try:
+                self.history_start = int(arg) if arg else 0
+            except ValueError:
+                # if no valid number was given, ignore it
+                pass
         self.args = (channelname.strip(), msg.strip())
 
     def func(self):
@@ -63,12 +90,16 @@ class ChannelCommand(command.Command):
         Create a new message and send it to channel, using
         the already formatted input.
         """
+        global _CHANNELDB
+        if not _CHANNELDB:
+            from evennia.comms.models import ChannelDB as _CHANNELDB
+
         channelkey, msg = self.args
         caller = self.caller
         if not msg:
             self.msg(_("Say what?"))
             return
-        channel = ChannelDB.objects.get_channel(channelkey)
+        channel = _CHANNELDB.objects.get_channel(channelkey)
 
         if not channel:
             self.msg(_("Channel '%s' not found.") % channelkey)
@@ -81,14 +112,42 @@ class ChannelCommand(command.Command):
             string = _("You are not permitted to send to channel '%s'.")
             self.msg(string % channelkey)
             return
-        channel.msg(msg, senders=self.caller, online=True)
+        if msg == "on":
+            caller = caller if not hasattr(caller, 'account') else caller.account
+            unmuted = channel.unmute(caller)
+            if unmuted:
+                self.msg("You start listening to %s." % channel)
+                return
+            self.msg("You were already listening to %s." % channel)
+            return
+        if msg == "off":
+            caller = caller if not hasattr(caller, 'account') else caller.account
+            muted = channel.mute(caller)
+            if muted:
+                self.msg("You stop listening to %s." % channel)
+                return
+            self.msg("You were already not listening to %s." % channel)
+            return
+        if self.history_start is not None:
+            # Try to view history
+            log_file = channel.attributes.get("log_file", default="channel_%s.log" % channel.key)
+
+            def send_msg(lines): return self.msg("".join(line.split("[-]", 1)[1]
+                                                         if "[-]" in line else line for line in lines))
+            tail_log_file(log_file, self.history_start, 20, callback=send_msg)
+        else:
+            caller = caller if not hasattr(caller, 'account') else caller.account
+            if caller in channel.mutelist:
+                self.msg("You currently have %s muted." % channel)
+                return
+            channel.msg(msg, senders=self.caller, online=True)
 
     def get_extra_info(self, caller, **kwargs):
         """
         Let users know that this command is for communicating on a channel.
 
         Args:
-            caller (TypedObject): A Character or Player who has entered an ambiguous command.
+            caller (TypedObject): A Character or Account who has entered an ambiguous command.
 
         Returns:
             A string with identifying information to disambiguate the object, conventionally with a preceding space.
@@ -100,66 +159,43 @@ class ChannelHandler(object):
     """
     The ChannelHandler manages all active in-game channels and
     dynamically creates channel commands for users so that they can
-    just give the channek's key or alias to write to it. Whenever a
+    just give the channel's key or alias to write to it. Whenever a
     new channel is created in the database, the update() method on
     this handler must be called to sync it with the database (this is
     done automatically if creating the channel with
     evennia.create_channel())
 
     """
+
     def __init__(self):
         """
         Initializes the channel handler's internal state.
 
         """
-        self.cached_channel_cmds = []
-        self.cached_cmdsets = {}
+        self._cached_channel_cmds = {}
+        self._cached_cmdsets = {}
+        self._cached_channels = {}
 
     def __str__(self):
         """
         Returns the string representation of the handler
 
         """
-        return ", ".join(str(cmd) for cmd in self.cached_channel_cmds)
+        return ", ".join(str(cmd) for cmd in self._cached_channel_cmds)
 
     def clear(self):
         """
         Reset the cache storage.
 
         """
-        self.cached_channel_cmds = []
+        self._cached_channel_cmds = {}
+        self._cached_cmdsets = {}
+        self._cached_channels = {}
 
-    def _format_help(self, channel):
+    def add(self, channel):
         """
-        Builds an automatic doc string for the channel.
-
-        Args:
-            channel (Channel): Source of help info.
-
-        Returns:
-            doc (str): The docstring for the channel.
-
-        """
-
-        key = channel.key
-        aliases = channel.aliases.all()
-        ustring = _("%s <message>") % key.lower() + "".join([_("\n           %s <message>") % alias.lower() for alias in aliases])
-        desc = channel.db.desc
-        string = _(
-        """
-        Channel '%s'
-
-        Usage (not including your personal aliases):
-           %s
-
-        %s
-        """) % (key, ustring, desc)
-        return string
-
-    def add_channel(self, channel):
-        """
-        Add an individual channel to the handler. This should be
-        called whenever a new channel is created.
+        Add an individual channel to the handler. This is called
+        whenever a new channel is created.
 
         Args:
             channel (Channel): The channel to add.
@@ -171,16 +207,40 @@ class ChannelHandler(object):
             the Channel itself.
 
         """
+        global _CHANNEL_COMMAND_CLASS
+        if not _CHANNEL_COMMAND_CLASS:
+            _CHANNEL_COMMAND_CLASS = class_from_module(settings.CHANNEL_COMMAND_CLASS)
+
         # map the channel to a searchable command
-        cmd = ChannelCommand(key=channel.key.strip().lower(),
-                             aliases=channel.aliases.all(),
-                             locks="cmd:all();%s" % channel.locks,
-                             help_category="Channel names",
-                             obj=channel,
-                             arg_regex=r"\s.*?",
-                             is_channel=True)
-        self.cached_channel_cmds.append(cmd)
-        self.cached_cmdsets = {}
+        cmd = _CHANNEL_COMMAND_CLASS(
+            key=channel.key.strip().lower(),
+            aliases=channel.aliases.all(),
+            locks="cmd:all();%s" % channel.locks,
+            help_category="Channel names",
+            obj=channel,
+            is_channel=True)
+        # format the help entry
+        key = channel.key
+        cmd.__doc__ = cmd.__doc__.format(channelkey=key,
+                                         lower_channelkey=key.strip().lower(),
+                                         channeldesc=channel.attributes.get(
+                                            "desc", default="").strip())
+        self._cached_channel_cmds[channel] = cmd
+        self._cached_channels[key] = channel
+        self._cached_cmdsets = {}
+    add_channel = add  # legacy alias
+
+    def remove(self, channel):
+        """
+        Remove channel from channelhandler. This will also delete it.
+
+        Args:
+            channel (Channel): Channel to remove/delete.
+
+        """
+        if channel.pk:
+            channel.delete()
+        self.update()
 
     def update(self):
         """
@@ -188,10 +248,30 @@ class ChannelHandler(object):
         Channel objects. This must be called after deleting a Channel.
 
         """
-        self.cached_channel_cmds = []
-        self.cached_cmdsets = {}
-        for channel in ChannelDB.objects.get_all_channels():
-            self.add_channel(channel)
+        global _CHANNELDB
+        if not _CHANNELDB:
+            from evennia.comms.models import ChannelDB as _CHANNELDB
+        self._cached_channel_cmds = {}
+        self._cached_cmdsets = {}
+        self._cached_channels = {}
+        for channel in _CHANNELDB.objects.get_all_channels():
+            self.add(channel)
+
+    def get(self, channelname=None):
+        """
+        Get a channel from the handler, or all channels
+
+        Args:
+            channelame (str, optional): Channel key, case insensitive.
+        Returns
+            channels (list): The matching channels in a list, or all
+                channels in the handler.
+
+        """
+        if channelname:
+            channel = self._cached_channels.get(channelname.lower(), None)
+            return [channel] if channel else []
+        return list(self._cached_channels.values())
 
     def get_cmdset(self, source_object):
         """
@@ -207,19 +287,24 @@ class ChannelHandler(object):
                 access to.
 
         """
-        if source_object in self.cached_cmdsets:
-            return self.cached_cmdsets[source_object]
+        if source_object in self._cached_cmdsets:
+            return self._cached_cmdsets[source_object]
         else:
-            # create a new cmdset holding all channels
-            chan_cmdset = cmdset.CmdSet()
-            chan_cmdset.key = '_channelset'
-            chan_cmdset.priority = 120
-            chan_cmdset.duplicates = True
-            for cmd in [cmd for cmd in self.cached_channel_cmds
-                        if cmd.access(source_object, 'send')]:
-                chan_cmdset.add(cmd)
-            self.cached_cmdsets[source_object] = chan_cmdset
+            # create a new cmdset holding all viable channels
+            chan_cmdset = None
+            chan_cmds = [channelcmd for channel, channelcmd in self._cached_channel_cmds.items()
+                         if channel.subscriptions.has(source_object) and
+                         channelcmd.access(source_object, 'send')]
+            if chan_cmds:
+                chan_cmdset = cmdset.CmdSet()
+                chan_cmdset.key = 'ChannelCmdSet'
+                chan_cmdset.priority = 101
+                chan_cmdset.duplicates = True
+                for cmd in chan_cmds:
+                    chan_cmdset.add(cmd)
+            self._cached_cmdsets[source_object] = chan_cmdset
             return chan_cmdset
 
+
 CHANNEL_HANDLER = ChannelHandler()
-CHANNELHANDLER = CHANNEL_HANDLER # legacy
+CHANNELHANDLER = CHANNEL_HANDLER  # legacy

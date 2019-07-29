@@ -16,6 +16,7 @@ class ServerConfigManager(models.Manager):
     the server at run-time.
 
     """
+
     def conf(self, key=None, value=None, delete=False, default=None):
         """
         Add, retrieve and manipulate config values.
@@ -49,19 +50,4 @@ class ServerConfigManager(models.Manager):
             if not conf:
                 return default
             return conf[0].value
-
-    def get_mysql_db_version(self):
-        """
-        This is a helper method for specifically getting the version
-        string of a MySQL database.
-
-        Returns:
-            mysql_version (str): The currently used mysql database
-                version.
-
-        """
-        from django.db import connection
-        conn = connection.cursor()
-        conn.execute("SELECT VERSION()")
-        version = conn.fetchone()
-        return version and str(version[0]) or ""
+        return None

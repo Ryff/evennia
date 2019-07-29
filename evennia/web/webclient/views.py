@@ -4,25 +4,28 @@ This contains a simple view for rendering the webclient
 page and serve it eventual static content.
 
 """
-from __future__ import print_function
-from django.shortcuts import render
 
-from evennia.players.models import PlayerDB
+from django.conf import settings
+from django.http import Http404
+from django.shortcuts import render
+from django.contrib.auth import login, authenticate
+
+from evennia.accounts.models import AccountDB
+from evennia.utils import logger
 
 
 def webclient(request):
     """
     Webclient page template loading.
+
     """
+    # auto-login is now handled by evennia.web.utils.middleware
 
-    # analyze request to find which port we are on
-    if int(request.META["SERVER_PORT"]) == 8000:
-        # we relay webclient to the portal port
-        print("Called from port 8000!")
-        #return redirect("http://localhost:8001/webclient/", permanent=True)
+    # check if webclient should be enabled
+    if not settings.WEBCLIENT_ENABLED:
+        raise Http404
 
-    nsess = len(PlayerDB.objects.get_connected_players()) or "none"
-    # as an example we send the number of connected players to the template
-    pagevars = {'num_players_connected': nsess}
+    # make sure to store the browser session's hash so the webclient can get to it!
+    pagevars = {'browser_sessid': request.session.session_key}
 
     return render(request, 'webclient.html', pagevars)
